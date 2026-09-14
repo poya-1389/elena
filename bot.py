@@ -388,13 +388,16 @@ def register_handlers(dp: Dispatcher) -> None:
 
     @dp.message(Command("stats"))
     async def cmd_stats(message: Message) -> None:
-        used_today, used_4h = await db.get_usage(message.chat.id, message.from_user.id)
-        text = f"این چت:\n- امروز: {used_today} از 75\n- این ۴ ساعت اخیر: {used_4h} از 30"
+        _, used_today, limit_today, used_4h, limit_4h = await db.check_limit(message.chat.id, message.from_user.id)
+        text = f"این چت:\n- امروز: {used_today} از {limit_today}\n- این ۴ ساعت اخیر: {used_4h} از {limit_4h}"
         await message.answer(text)
 
     @dp.message(Command("premium"))
     async def cmd_premium(message: Message) -> None:
-        await message.answer("فعلاً فروش نسخه‌ی Premium در دسترس نیست.")
+        await message.answer(
+            "فعلاً فروش نسخه‌ی Premium در دسترس نیست.\n"
+            "(مشترک‌ها ۵۰۰ پیام در هر ۴ ساعت دارن، به‌جای ۳۰ تای معمولی.)"
+        )
 
     @dp.message(Command("admin"))
     async def cmd_admin(message: Message) -> None:
