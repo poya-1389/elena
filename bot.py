@@ -1,7 +1,7 @@
 """
 bot.py — نقطه‌ی ورود ربات النا (Elena)
 
-Stack: Python 3.12+ / aiogram >= 3.31 (Bot API 10.3) / PostgreSQL (Railway) / Gemini 3.6 Flash
+Stack: Python 3.12+ / aiogram >= 3.31 (Bot API 10.3) / PostgreSQL (Railway) / Gemini 3.5 Flash-Lite
 
 تصمیم Polling در برابر Webhook: توضیح در نسخه‌های قبلی این فایل — همچنان Polling.
 """
@@ -32,7 +32,7 @@ from aiogram.types import (
 )
 
 import ai
-from database import Database
+from database import Database, TIERS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("elena.bot")
@@ -42,6 +42,10 @@ AMBIENT_KEYWORDS = ("نظرت", "به نظر", "نظر شما", "نظرتون", 
 EDIT_THROTTLE_CHARS = 48
 TYPING_REFRESH_SECONDS = 4
 ADMIN_PAGE_SIZE = 6
+
+TIER_LABELS = {"free": "معمولی (رایگان)", "pro": "Pro", "promax": "Pro Max"}
+TIER_BADGES = {"free": "F", "pro": "P", "promax": "PM"}
+MODE_LABELS = {"default": "پیش‌فرض", "warm": "نزدیک‌تر", "custom": "ویژه (Pro Max)"}
 
 REACT_RE = re.compile(r"^\s*REACT:\s*(\S+)\s*\n?")
 GROUP_JOIN_TEXT = (
@@ -137,12 +141,15 @@ def is_ambient_worthy(text: str) -> bool:
     return any(k in t for k in AMBIENT_KEYWORDS)
 
 
-def author_label(message: Message) -> str | None:
+def author_info(message: Message) -> tuple[str | None, str | None]:
+    """برمی‌گردونه (author_name, author_username) — فقط برای گروه‌ها؛ تو پیوی None."""
     if message.chat.type == "private":
-        return None
+        return None, None
     user = message.from_user
     name = user.first_name or (user.username or "کاربر")
-    return f"{name} [ربات]" if user.is_bot else name
+    if user.is_bot:
+        name = f"{name} [ربات]"
+    return name, user.username
 
 
 async def _typing_loop(bot: Bot, chat_id: int, stop_event: asyncio.Event) -> None:
@@ -172,9 +179,9 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
     chat_id = message.chat.id
     user = message.from_user
     is_group = message.chat.type != "private"
-    author_name = author_label(message)
+    author_name, author_username = author_info(message)
 
-    allowed, used_today, limit_today, used_4h, limit_4h = await db.check_limit(chat_id, user.id)
+    allowed, used_today, limit_today, used_4h, limit_4h, history_limit = await db.check_limit(chat_id, user.id)
     if not allowed:
         if is_group:
             return  # در گروه بی‌سروصدا رد شو
@@ -185,7 +192,8 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
         return
 
     await db.upsert_user(user.id, user.first_name, user.username)
-    history = await db.get_history(chat_id)
+    history = await db.get_history(chat_id, limit=history_limit)
+    mode = await db.get_mode(user.id)
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(message.bot, chat_id, stop_typing))
@@ -201,7 +209,12 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
 
     try:
         async for chunk in ai.generate_reply_stream(
-            history=history, user_text=user_text, author_name=author_name, media=media
+            history=history,
+            user_text=user_text,
+            author_name=author_name,
+            author_username=author_username,
+            chat_kind="group" if is_group else "private",
+            mode=mode,
         ):
             if chunk == "__ELENA_AI_QUOTA__":
                 quota_exhausted = True
@@ -212,8 +225,6 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
             buffer += chunk
 
             if not reaction_checked:
-                # منتظر می‌مونیم تا یا یه REACT کامل ببینیم یا بافر به اندازه‌ی کافی
-                # بزرگ بشه که مطمئن بشیم دیگه REACT نیست
                 m = REACT_RE.match(buffer)
                 if m:
                     await _try_react(message, m.group(1))
@@ -224,7 +235,6 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
 
             if not reaction_checked:
                 continue
-
             if not buffer.strip():
                 continue
 
@@ -270,13 +280,12 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
         return
 
     if not buffer.strip():
-        # فقط Reaction بود، متن اضافه‌ای لازم نیست
         if placeholder is not None:
             try:
                 await placeholder.delete()
             except TelegramBadRequest:
                 pass
-        await db.add_turn(chat_id, "user", user_text, author_name=author_name)
+        await db.add_turn(chat_id, "user", user_text, author_name=author_name, author_username=author_username)
         await db.log_success(chat_id, user.id)
         if is_group:
             await db.mark_ambient_reply(chat_id)
@@ -297,7 +306,7 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
         except TelegramBadRequest:
             pass
 
-    await db.add_turn(chat_id, "user", user_text, author_name=author_name)
+    await db.add_turn(chat_id, "user", user_text, author_name=author_name, author_username=author_username)
     await db.add_turn(chat_id, "model", buffer)
     await db.log_success(chat_id, user.id)
 
@@ -306,12 +315,37 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
 
 
 # ---------------------------------------------------------------------------
+# /premium — وضعیت اشتراک + انتخاب حالت (فقط برای مشترک‌ها)
+# ---------------------------------------------------------------------------
+async def _render_premium(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    tier = await db.get_tier(user_id)
+    mode = await db.get_mode(user_id)
+    daily, window, _ = await db.get_tier_limits(user_id)
+
+    lines = [
+        f"وضعیت اشتراک: <b>{TIER_LABELS[tier]}</b>",
+        f"محدودیت پیام: {window} در ۴ ساعت اخیر ({daily} در روز)",
+    ]
+
+    if tier == "free":
+        lines.append("\nفعلاً فروش Pro و Pro Max در دسترس نیست.")
+        return "\n".join(lines), None
+
+    lines.append("\nحالت رفتاری النا با خودت رو انتخاب کن:")
+    rows = []
+    for m in ("default", "warm", "custom"):
+        label = MODE_LABELS[m] + (" ✓" if m == mode else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"pmset:{m}", style="primary")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
 # پنل ادمین
 # ---------------------------------------------------------------------------
 def _admin_list_kb(users: list[dict], page: int, total: int) -> InlineKeyboardMarkup:
     rows = []
     for u in users:
-        label = f"{'⭐' if u['premium'] else '▫️'} {u['first_name'] or u['user_id']}"
+        label = f"[{TIER_BADGES[u['tier']]}] {u['first_name'] or u['user_id']}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"adm_u:{u['user_id']}:{page}")])
     nav = []
     if page > 0:
@@ -325,12 +359,12 @@ def _admin_list_kb(users: list[dict], page: int, total: int) -> InlineKeyboardMa
 
 async def _render_admin_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
     total = await db.count_users()
-    premium_count = await db.count_premium()
+    by_tier = await db.count_by_tier()
     users = await db.list_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
     text = (
         "🛠 <b>پنل مدیریت Elena</b>\n\n"
         f"کل کاربران: <b>{total}</b>\n"
-        f"مشترک‌های فعال: <b>{premium_count}</b>\n\n"
+        f"Free: {by_tier['free']} — Pro: {by_tier['pro']} — Pro Max: {by_tier['promax']}\n\n"
         f"صفحه‌ی {page + 1} — روی هر کاربر بزن برای مدیریت:"
     )
     return text, _admin_list_kb(users, page, total)
@@ -340,18 +374,23 @@ async def _render_admin_user(user_id: int, page: int) -> tuple[str, InlineKeyboa
     u = await db.get_user(user_id)
     if not u:
         return "کاربر پیدا نشد.", _admin_list_kb([], page, 0)
-    status = "⭐ مشترک" if u["premium"] else "▫️ بدون اشتراک"
     text = (
         f"👤 <b>{u['first_name'] or '—'}</b>\n"
         + (f"یوزرنیم: @{u['username']}\n" if u["username"] else "")
         + f"آیدی: <code>{u['user_id']}</code>\n"
         + f"عضویت از: {u['created_at'].strftime('%Y-%m-%d')}\n"
-        + f"وضعیت: {status}"
+        + f"سطح فعلی: <b>{TIER_LABELS[u['tier']]}</b>"
     )
-    toggle_text = "❌ لغو اشتراک" if u["premium"] else "⭐ فعال‌سازی اشتراک"
+    tier_buttons = [
+        InlineKeyboardButton(
+            text=("✓ " if u["tier"] == t else "") + TIER_LABELS[t],
+            callback_data=f"adm_st:{user_id}:{t}:{page}",
+        )
+        for t in TIERS
+    ]
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_text, callback_data=f"adm_t:{user_id}:{page}")],
+            tier_buttons,
             [InlineKeyboardButton(text="◀️ بازگشت به لیست", callback_data=f"adm_p:{page}")],
         ]
     )
@@ -388,16 +427,29 @@ def register_handlers(dp: Dispatcher) -> None:
 
     @dp.message(Command("stats"))
     async def cmd_stats(message: Message) -> None:
-        _, used_today, limit_today, used_4h, limit_4h = await db.check_limit(message.chat.id, message.from_user.id)
+        _, used_today, limit_today, used_4h, limit_4h, _ = await db.check_limit(message.chat.id, message.from_user.id)
         text = f"این چت:\n- امروز: {used_today} از {limit_today}\n- این ۴ ساعت اخیر: {used_4h} از {limit_4h}"
         await message.answer(text)
 
     @dp.message(Command("premium"))
     async def cmd_premium(message: Message) -> None:
-        await message.answer(
-            "فعلاً فروش نسخه‌ی Premium در دسترس نیست.\n"
-            "(مشترک‌ها ۵۰۰ پیام در هر ۴ ساعت دارن، به‌جای ۳۰ تای معمولی.)"
-        )
+        await db.upsert_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+        text, kb = await _render_premium(message.from_user.id)
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+    @dp.callback_query(F.data.startswith("pmset:"))
+    async def cb_premium_mode(call: CallbackQuery) -> None:
+        mode = call.data.split(":", 1)[1]
+        ok = await db.set_mode(call.from_user.id, mode)
+        if not ok:
+            await call.answer("این حالت برای سطح اشتراک فعلیت باز نیست.", show_alert=True)
+            return
+        text, kb = await _render_premium(call.from_user.id)
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
+            pass
+        await call.answer("حالت عوض شد ✓")
 
     @dp.message(Command("admin"))
     async def cmd_admin(message: Message) -> None:
@@ -418,12 +470,10 @@ def register_handlers(dp: Dispatcher) -> None:
         elif action == "adm_u":
             uid_str, _, page_str = rest.partition(":")
             text, kb = await _render_admin_user(int(uid_str), int(page_str))
-        elif action == "adm_t":
-            uid_str, _, page_str = rest.partition(":")
-            uid = int(uid_str)
-            current = await db.get_user(uid)
-            await db.set_premium(uid, not bool(current and current["premium"]))
-            text, kb = await _render_admin_user(uid, int(page_str))
+        elif action == "adm_st":
+            uid_str, tier, page_str = rest.split(":")
+            await db.set_tier(int(uid_str), tier)
+            text, kb = await _render_admin_user(int(uid_str), int(page_str))
         else:
             await call.answer()
             return
@@ -474,7 +524,8 @@ def register_handlers(dp: Dispatcher) -> None:
             await stream_reply(message, text)
             return
 
-        await db.add_turn(message.chat.id, "user", text, author_name=author_label(message))
+        author_name, author_username = author_info(message)
+        await db.add_turn(message.chat.id, "user", text, author_name=author_name, author_username=author_username)
 
         if not is_ambient_worthy(text):
             return
