@@ -175,7 +175,9 @@ async def _try_react(message: Message, emoji: str) -> None:
         logger.info("Reaction %r rejected: %s", emoji, exc)
 
 
-async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes, str]] | None = None) -> None:
+async def stream_reply(
+    message: Message, user_text: str, media: list[tuple[bytes, str]] | None = None, is_ambient: bool = False
+) -> None:
     chat_id = message.chat.id
     user = message.from_user
     is_group = message.chat.type != "private"
@@ -204,6 +206,7 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
     quota_exhausted = False
     placeholder: Message | None = None
     reaction_checked = False
+    reaction_applied = False
 
     send = message.reply if is_group else message.answer
 
@@ -228,6 +231,7 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
                 m = REACT_RE.match(buffer)
                 if m:
                     await _try_react(message, m.group(1))
+                    reaction_applied = True
                     buffer = buffer[m.end():]
                     reaction_checked = True
                 elif len(buffer) > 24 or "\n" in buffer:
@@ -280,6 +284,19 @@ async def stream_reply(message: Message, user_text: str, media: list[tuple[bytes
         return
 
     if not buffer.strip():
+        if not reaction_applied and not is_ambient:
+            # پاسخ کاملاً خالی بود و هیچ ری‌اکشنی هم نزدیم — این یعنی مدل رفتار
+            # درستی نداشته؛ تو یه پیام مستقیم هیچ‌وقت نباید کاربر رو ساکت بذاریم
+            logger.warning("Empty AI response with no reaction for chat_id=%s", chat_id)
+            fallback = "چیزی نگفتم؟ یه‌بار دیگه بگو."
+            if placeholder is not None:
+                try:
+                    await placeholder.edit_text(fallback)
+                except TelegramBadRequest:
+                    pass
+            else:
+                await send(fallback)
+            return
         if placeholder is not None:
             try:
                 await placeholder.delete()
@@ -542,7 +559,7 @@ def register_handlers(dp: Dispatcher) -> None:
             """,
             message.chat.id,
         )
-        await stream_reply(message, text)
+        await stream_reply(message, text, is_ambient=True)
 
 
 async def main() -> None:
@@ -572,10 +589,10 @@ async def main() -> None:
     if admin_id:
         await bot.set_my_commands(
             [
-                {"command": "start", "description": "Start — Restart Elna"},
+                {"command": "start", "description": "Start — Restart Eelna"},
                 {"command": "stats", "description": "Consumption status"},
                 {"command": "premium", "description": "Upgrade subscription"},
-                {"command": "admin", "description": "پنل مدیریت"},
+                {"command": "admin", "description": "ADMIN PANEL"},
             ],
             scope=BotCommandScopeChat(chat_id=admin_id),
         )
